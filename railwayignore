@@ -1,0 +1,15 @@
+# Exclude anything that isn't needed in the Railway build
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+*.json
+*.csv
+*.log
+*.txt
+!requirements.txt
+.git/
+.env
+*.md
+data/
+tmp/
