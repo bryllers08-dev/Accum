@@ -78,9 +78,9 @@ API_TOKEN   = os.getenv("DERIV_API_TOKEN", "")
 APP_ID      = os.getenv("DERIV_APP_ID",    "1089")
 WS_URL      = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
 
-COLLECT_MINS      = float(os.getenv("COLLECT_MINS", "30"))
+COLLECT_MINS      = float(os.getenv("COLLECT_MINS", "10"))
 COLLECT_SECS      = COLLECT_MINS * 60
-ROLLING_MAX_HOURS = float(os.getenv("ROLLING_MAX_HOURS", "2"))
+ROLLING_MAX_HOURS = float(os.getenv("ROLLING_MAX_HOURS", "0.35"))
 ROLLING_MAX_SECS  = ROLLING_MAX_HOURS * 3600
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL",    "")
