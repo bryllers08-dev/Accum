@@ -78,9 +78,9 @@ API_TOKEN   = os.getenv("DERIV_API_TOKEN", "")
 APP_ID      = os.getenv("DERIV_APP_ID",    "1089")
 WS_URL      = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
 
-COLLECT_MINS      = float(os.getenv("COLLECT_MINS", "10"))
+COLLECT_MINS      = float(os.getenv("COLLECT_MINS", "30"))
 COLLECT_SECS      = COLLECT_MINS * 60
-ROLLING_MAX_HOURS = float(os.getenv("ROLLING_MAX_HOURS", "0.35"))
+ROLLING_MAX_HOURS = float(os.getenv("ROLLING_MAX_HOURS", "2"))
 ROLLING_MAX_SECS  = ROLLING_MAX_HOURS * 3600
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL",    "")
@@ -474,10 +474,15 @@ class BarrierSimulator:
         }
 
     @classmethod
-    def best_rate(cls, prices: list) -> dict:
+    def best_rate(cls, prices: list, max_ticks: int = 30) -> dict:
+        """
+        max_ticks: realistic hold horizon for simulation.
+        Kept at 30 (not MAX_HOLD_TICKS=40) so knock-outs are visible
+        even in calm markets — prevents all-survival single-class labels.
+        """
         results = {}
         for gr in cls.GROWTH_RATES:
-            results[gr] = cls.simulate(prices, gr)
+            results[gr] = cls.simulate(prices, gr, max_ticks=max_ticks)
             info(f"[SIM] growth={gr}%  ko_rate={results[gr]['ko_rate']:.1%}  "
                  f"median_ticks={results[gr]['median_ticks']}  "
                  f"ev={results[gr]['expected_value']:+.4f}")
@@ -531,7 +536,7 @@ def compute_calibration(summaries: List[dict]) -> dict:
         z_p50      = pct(zscores,  50)
         spike_p85  = pct(spikes,   85)
 
-        sim_result = BarrierSimulator.best_rate(prices_all)
+        sim_result = BarrierSimulator.best_rate(prices_all, max_ticks=30)
         best_gr    = sim_result["best"]
         sim_stats  = sim_result["all"][best_gr]
 
@@ -543,9 +548,19 @@ def compute_calibration(summaries: List[dict]) -> dict:
         p10 = sim_stats["p_survive_10"]
         p20 = sim_stats["p_survive_20"]
         p30 = sim_stats["p_survive_30"]
-        ratchet1 = round(max(1.15, 1.0 + (best_gr / 100) * 10 * p10), 2)
-        ratchet2 = round(max(1.40, 1.0 + (best_gr / 100) * 20 * p20), 2)
-        ratchet3 = round(max(1.80, 1.0 + (best_gr / 100) * 30 * p30), 2)
+        # Ratchet targets based on realistic compounded payout at each tier.
+        # For 5% growth: 1.05^10=1.63, 1.05^20=2.65, 1.05^30=4.32
+        # We set targets at 85% of theoretical max to give room to exit.
+        r1_theoretical = (1 + best_gr/100) ** 10
+        r2_theoretical = (1 + best_gr/100) ** 20
+        r3_theoretical = (1 + best_gr/100) ** 30
+        ratchet1 = round(max(1.20, r1_theoretical * 0.85 * p10 + 1.0 * (1-p10)), 2)
+        ratchet2 = round(max(1.60, r2_theoretical * 0.85 * p20 + 1.0 * (1-p20)), 2)
+        ratchet3 = round(max(2.20, r3_theoretical * 0.85 * p30 + 1.0 * (1-p30)), 2)
+        # Hard floor: ratchet1 must be > what growth compounds to by tick 5
+        # so E5 doesn't fire in the first few ticks
+        min_r1 = round((1 + best_gr/100) ** max(5, target_ticks // 4) * 1.05, 2)
+        ratchet1 = max(ratchet1, min_r1)
 
         entry = {
             "symbol":          sym,
@@ -947,6 +962,32 @@ def retrain_ensemble(cal: dict):
     X, y = _build_feature_matrix(rows_raw, sigma_gate, labels)
     info(f"[ENS] Training {len(X)} samples  "
          f"survival_rate={y.mean()*100:.1f}%  growth={growth_rate}%  target={target_t}t")
+
+    # Guard: need both classes to train classifiers
+    n_pos = int(y.sum()); n_neg = len(y) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        warn(f"[ENS] Single-class labels (pos={n_pos} neg={n_neg}) — "
+             f"skipping L1/L2. Only IsoForest (L3) will train. "
+             f"Try longer COLLECT_MINS or lower growth rate.")
+        # Still train IsoForest on the available (all-win) data
+        try:
+            from sklearn.ensemble import IsolationForest
+            iso = IsolationForest(n_estimators=200,
+                                  contamination=ISO_CONTAMINATION,
+                                  random_state=42, n_jobs=-1)
+            iso.fit(X)
+            win_scores = iso.score_samples(X)
+            iso._ens_threshold = float(
+                np.percentile(win_scores, ISO_CONTAMINATION * 100))
+            out = os.path.join(_PERSIST_DIR, "iso_model.pkl")
+            with open(out, 'wb') as f: pickle.dump(iso, f)
+            _store.upload(out, "iso_model.pkl")
+            info(f"[ENS] L3 IsoForest trained on {len(X)} rows  "
+                 f"thr={iso._ens_threshold:.4f}")
+        except Exception as e: warn(f"[ENS] L3 single-class: {e}")
+        _ensemble = EnsembleGate(_PERSIST_DIR, sigma_gate)
+        info("[ENS] Partial retrain complete (L3 only)")
+        return
 
     # L1: XGBoost
     xgb_ok = False
@@ -1432,13 +1473,21 @@ class Collector:
         if self._ws:
             try: await self._ws.close()
             except Exception: pass
+        # Cancel collector IO tasks cleanly — prevents "Task destroyed pending" warning
+        for t in getattr(self, "_io_tasks", []):
+            if not t.done(): t.cancel()
+        if getattr(self, "_io_tasks", []):
+            await asyncio.gather(*self._io_tasks, return_exceptions=True)
         return compute_calibration(summaries)
 
     async def _connect_and_auth(self):
         info("Collector: connecting...")
         self._ws = await websockets.connect(WS_URL, ping_interval=20, ping_timeout=15)
-        asyncio.create_task(self._recv_pump())
-        asyncio.create_task(self._send_pump())
+        # Track IO tasks so we can cancel them cleanly on Collector exit
+        self._io_tasks = [
+            asyncio.create_task(self._recv_pump(), name="col_recv"),
+            asyncio.create_task(self._send_pump(), name="col_send"),
+        ]
         await self._send({"authorize": API_TOKEN})
         resp = await self._recv_one("authorize", timeout=15)
         if not resp or "error" in resp:
@@ -1741,6 +1790,21 @@ class DerivClient:
 
     async def buy_accumulator(self, symbol: str, growth_rate: int,
                                stake: float) -> Tuple[Optional[int], Optional[float]]:
+        # Drain any stale tick messages from inbox before sending proposal
+        # so _recv_type("proposal") doesn't time out grabbing tick responses
+        drained = 0
+        while not self._inbox.empty():
+            try:
+                msg = self._inbox.get_nowait()
+                # Put non-tick messages back (could be settlement updates)
+                if "tick" not in msg:
+                    await self._inbox.put(msg)
+                else:
+                    drained += 1
+            except Exception: break
+        if drained:
+            info(f"[BUY] Drained {drained} stale tick(s) from inbox")
+
         await self._send_msg({
             "proposal": 1, "amount": stake, "basis": "stake",
             "contract_type": "ACCU", "currency": "USD",
@@ -1939,24 +2003,59 @@ class SymbolTrader:
         if not self.waiting or not self.current_trade: return
         cid      = self.current_trade["id"]
         ticks_in = self._monitor.ticks if self._monitor else 0
+        stake    = self.current_trade["stake"]
         info(f"[{self.symbol}] EXIT {reason} after {ticks_in}t  est=${est_payout:.4f}")
         self._exit_counts[reason] = self._exit_counts.get(reason, 0) + 1
+
         sold = await self.client.sell_contract(cid)
         if sold:
             sold_for = float(sold.get("sold_for", 0))
-            profit   = sold_for - self.current_trade["stake"]
+            profit   = sold_for - stake
             await self.client.fetch_balance()
             if profit > 0:
                 self.risk.record_win(profit)
                 tlog(f"[{self.symbol}] SOLD({reason}) +${profit:.4f} ticks={ticks_in}")
             else:
-                self.risk.record_loss(self.current_trade["stake"])
+                self.risk.record_loss(stake)
                 _ko_tracker.record(
                     self.symbol, self.current_trade["growth_rate"], ticks_in,
                     self.current_trade["entry_sigma"], self.current_trade["entry_spike"],
-                    self.current_trade["entry_regime"], reason,
-                    self.current_trade["stake"], profit)
-        self._unlock(reason)
+                    self.current_trade["entry_regime"], reason, stake, profit)
+            self._unlock(reason)
+            return
+
+        # sell_contract returned None — contract may have already expired/settled.
+        # Poll for the final result instead of silently unlocking with no record.
+        warn(f"[{self.symbol}] Sell returned None for cid={cid} "
+             f"(likely already expired) — polling for settlement")
+        for attempt in range(1, 6):
+            await asyncio.sleep(2)
+            try:
+                data = await self.client.poll_contract(cid)
+                if data and self.client.is_settled(data):
+                    profit = float(data.get("profit", 0))
+                    await self.client.fetch_balance()
+                    if profit > 0:
+                        self.risk.record_win(profit)
+                        tlog(f"[{self.symbol}] SETTLED({reason}) "
+                             f"+${profit:.4f} ticks={ticks_in}")
+                    else:
+                        self.risk.record_loss(stake)
+                        _ko_tracker.record(
+                            self.symbol, self.current_trade["growth_rate"],
+                            ticks_in, self.current_trade["entry_sigma"],
+                            self.current_trade["entry_spike"],
+                            self.current_trade["entry_regime"],
+                            "KNOCKOUT", stake, profit)
+                    self._unlock(reason)
+                    return
+            except Exception as exc:
+                warn(f"[{self.symbol}] Poll attempt {attempt}: {exc}")
+
+        # Still no result — force unlock to avoid permanent lock
+        warn(f"[{self.symbol}] Could not confirm settlement for cid={cid} "
+             f"— force unlocking to prevent lock-up")
+        self._unlock(f"{reason}_unconfirmed")
 
     async def _safety_poller(self, cid: int, growth_rate: int):
         await asyncio.sleep(max(10, TARGET_TICKS + 5))
